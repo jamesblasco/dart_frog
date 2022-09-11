@@ -65,37 +65,120 @@ class Router {
 
   /// Handle all request to [route] using [handler].
   void all(String route, Function handler) {
-    _routes.add(RouterEntry('ALL', route, handler));
+    _all(route, handler, mounted: false);
+  }
+
+  void _all(String route, Function handler, {required bool mounted}) {
+    _routes.add(RouterEntry('ALL', route, handler, mounted: mounted));
   }
 
   /// Mount a handler below a prefix.
-  ///
-  /// In this case prefix may not contain any parameters, nor
-  void mount(String prefix, Handler handler) {
+  void mount(String prefix, Function handler) {
     if (!prefix.startsWith('/')) {
       throw ArgumentError.value(prefix, 'prefix', 'must start with a slash');
     }
 
     // The first slash is always in request.handlerPath
     final path = prefix.substring(1);
+
+    // Prefix it with two underscores to avoid conflicts
+    // with user defined path parameters
+    const pathParam = '__path';
+
     if (prefix.endsWith('/')) {
-      all('$prefix<path|[^]*>', (RequestContext context) {
-        return handler(
-          RequestContext._(context.request._request.change(path: path)),
-        );
-      });
+      _all(
+        '$prefix<$pathParam|[^]*>',
+        (RequestContext context, RouterEntry route) {
+          // Remove path param from extracted route params
+          final params = [...route.params]..removeLast();
+          return _invokeMountedHandler(context, handler, path, params);
+        },
+        mounted: true,
+      );
     } else {
-      all(prefix, (RequestContext context) {
-        return handler(
-          RequestContext._(context.request._request.change(path: path)),
-        );
-      });
-      all('$prefix/<path|[^]*>', (RequestContext context) {
-        return handler(
-          RequestContext._(context.request._request.change(path: '$path/')),
-        );
-      });
+      _all(
+        prefix,
+        (RequestContext context, RouterEntry route) {
+          return _invokeMountedHandler(
+            context,
+            handler,
+            path,
+            route.params,
+          );
+        },
+        mounted: true,
+      );
+      _all(
+        '$prefix/<$pathParam|[^]*>',
+        (RequestContext context, RouterEntry route) {
+          // Remove path param from extracted route params
+          final params = [...route.params]..removeLast();
+          return _invokeMountedHandler(context, handler, '$path/', params);
+        },
+        mounted: true,
+      );
     }
+  }
+
+  Future<Response> _invokeMountedHandler(
+    RequestContext context,
+    Function handler,
+    String path,
+    List<ParamInfo> paramInfos,
+  ) async {
+    final params = _getParamsFromRequest(context.request);
+    final resolvedPath =
+        _replaceParamsInPath(context.request, path, params, paramInfos);
+
+    return await Function.apply(handler, [
+      RequestContext._(context.request._request.change(path: resolvedPath)),
+      ...paramInfos.map((info) => params[info.name]),
+    ]) as Response;
+  }
+
+  Map<String, String> _getParamsFromRequest(Request request) {
+    // ignore: cast_nullable_to_non_nullable
+    return request._request.context['shelf_router/params']
+        as Map<String, String>;
+  }
+
+  /// Replaces the variable slots (<someVar>) from [path] with the
+  /// values from [params]
+  String _replaceParamsInPath(
+    Request request,
+    String path,
+    Map<String, String> params,
+    List<ParamInfo> paramInfos,
+  ) {
+    // we iterate the non-resolved path and we write to a StringBuffer
+    // resolving ther parameters along the way
+    final resolvedPathBuff = StringBuffer();
+    var paramIndex = 0;
+    var charIndex = 0;
+    while (charIndex < path.length) {
+      if (paramIndex < paramInfos.length) {
+        final paramInfo = paramInfos[paramIndex];
+        if (charIndex < paramInfo.startIdx - 1) {
+          // Add up until the param slot starts
+          final part = path.substring(charIndex, paramInfo.startIdx - 1);
+          resolvedPathBuff.write(part);
+          charIndex += part.length;
+        } else {
+          // Add the resolved value of the parameter
+          final paramName = paramInfo.name;
+          final paramValue = params[paramName]!;
+          resolvedPathBuff.write(paramValue);
+          charIndex = paramInfo.endIdx - 1;
+          paramIndex++;
+        }
+      } else {
+        // All params looped, so add up until the end of the path
+        final part = path.substring(charIndex, path.length);
+        resolvedPathBuff.write(part);
+        charIndex += part.length;
+      }
+    }
+    return resolvedPathBuff.toString();
   }
 
   /// Route incoming requests to registered handlers.
@@ -196,6 +279,7 @@ class RouterEntry {
     String route,
     Function handler, {
     Middleware? middleware,
+    bool mounted = false,
   }) {
     middleware = middleware ?? ((Handler fn) => fn);
 
@@ -207,13 +291,26 @@ class RouterEntry {
       );
     }
 
-    final params = <String>[];
+    final params = <ParamInfo>[];
     var pattern = '';
+    // Keep the index where the matches are located
+    // so that we can calculate the positioning of
+    // the extracted parameter
+    var prevMatchIndex = 0;
     for (final m in _parser.allMatches(route)) {
+      final firstGroup = m[1]!;
       // ignore: use_string_buffers
-      pattern += RegExp.escape(m[1]!);
+      pattern += RegExp.escape(firstGroup);
       if (m[2] != null) {
-        params.add(m[2]!);
+        final paramName = m[2]!;
+        final startIdx = prevMatchIndex + firstGroup.length;
+        final paramInfo = ParamInfo(
+          name: paramName,
+          startIdx: startIdx,
+          endIdx: m.end,
+        );
+        params.add(paramInfo);
+        prevMatchIndex = m.end;
         if (m[3] != null && !_isNoCapture(m[3]!)) {
           throw ArgumentError.value(
             route,
@@ -233,6 +330,7 @@ class RouterEntry {
       middleware,
       routePattern,
       params,
+      mounted,
     );
   }
 
@@ -243,6 +341,7 @@ class RouterEntry {
     this._middleware,
     this._routePattern,
     this._params,
+    this._mounted,
   );
 
   /// Pattern for parsing the route pattern
@@ -253,13 +352,18 @@ class RouterEntry {
   final Function _handler;
   final Middleware _middleware;
 
+  /// Indicates this entry is used as a mounting point.
+  final bool _mounted;
+
   /// Expression that the request path must match.
   ///
   /// This also captures any parameters in the route pattern.
   final RegExp _routePattern;
 
+  final List<ParamInfo> _params;
+
   /// Names for the parameters in the route pattern.
-  final List<String> _params;
+  List<ParamInfo> get params => _params.toList();
 
   /// Returns a map from parameter name to value, if the path matches the
   /// route pattern. Otherwise returns null.
@@ -270,8 +374,9 @@ class RouterEntry {
     // Construct map from parameter name to matched value
     final params = <String, String>{};
     for (var i = 0; i < _params.length; i++) {
+      final param = _params[i];
       // first group is always the full match, we ignore this group.
-      params[_params[i]] = m[i + 1]!;
+      params[param.name] = m[i + 1]!;
     }
     return params;
   }
@@ -287,6 +392,14 @@ class RouterEntry {
     final _context = RequestContext._(request);
 
     return await _middleware((request) async {
+      if (_mounted) {
+        // if this route is mounted, we include
+        // the route itself as a parameter so
+        // that the mount can extract the parameters
+        // ignore: avoid_dynamic_calls
+        return await _handler(_context, this) as Response;
+      }
+
       if (_handler is Handler || _params.isEmpty) {
         // ignore: avoid_dynamic_calls
         return await _handler(_context) as Response;
@@ -294,9 +407,35 @@ class RouterEntry {
 
       final dynamic result = await Function.apply(_handler, <dynamic>[
         _context,
-        ..._params.map((n) => params[n]),
+        ..._params.map((param) => params[param.name]),
       ]);
       return result as Response;
     })(_context);
   }
+}
+
+/// {@template param_info}
+/// This class holds information about a parameter extracted
+/// from the route path.
+/// The indexes can by used by the mount logic to resolve the
+/// parametrized path when handling the request.
+/// {@endtemplate}
+class ParamInfo {
+  /// {@macro param_info}
+  const ParamInfo({
+    required this.name,
+    required this.startIdx,
+    required this.endIdx,
+  });
+
+  /// This is the name of the parameter, without <, >
+  final String name;
+
+  /// The index in the route String where the parameter
+  /// expression starts (inclusive)
+  final int startIdx;
+
+  /// The index in the route String where the parameter
+  /// expression ends (exclusive)
+  final int endIdx;
 }
